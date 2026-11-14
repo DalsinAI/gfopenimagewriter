@@ -1,0 +1,19 @@
+name: GFOpenImageWriter CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  host:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The host build and tests, once the tree has a CMakeLists.txt (as gfopennews's CI);
+      # until then this job only checks out, so an empty tree is green.
+      - name: Configure, build and test
+        run: |
+          if [ ! -f CMakeLists.txt ]; then echo "no CMakeLists.txt yet: nothing to build"; exit 0; fi
+          cmake -S . -B build
+          cmake --build build -j2
+          ctest --test-dir build --output-on-failure
