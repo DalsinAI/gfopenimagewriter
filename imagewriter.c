@@ -1,23 +1,27 @@
-/* GFOpenImageWriter 1.0: a disk image written to a whole drive, block for block, and a drive read into an image
- * (4 November 2026), its window in GFOpenLayout UI. For SD and CF cards, USB sticks and hard drives: an .img,
+/* GFOpenImageWriter 1.1: a disk image written to a whole drive, block for block, and a drive read into an image
+ * (1.0, 4 November 2026; 1.1, 14 November 2026, the storage model), its window in GFOpenLayout UI. For SD and CF cards, USB sticks and hard drives: an .img,
  * .iso, .hdf or any raw image.
  *
- * Choose the image, the device and one of its drives. Write image to drive asks first, naming the volumes on
- * the drive that are lost, and refuses a drive that holds the volume the system started from or one smaller than
- * the image. The drive's mounted partitions are inhibited while it is written (no handler touches it), and given
+ * Choose the image, the device and one of its drives. A drive is a unit on the device, shown by its model and
+ * serial (INQUIRY and its page $80); on acscsi.device the units are 0-15, never 7 (the host adapter). The volumes
+ * mounted from it are named only as what a write loses: a DH name never picks the drive. Write image to drive asks
+ * first, and refuses acscsi.device's boot drive (unit 0), a drive that holds the volume the system started from,
+ * and one smaller than the image (iw_drive.c, with host tests). The drive's mounted partitions are inhibited while it is written (no handler touches it), and given
  * back after. With "Read it back" on, each piece is read again and compared. Read drive to image saves the whole
  * drive to a file. Stop stops either between pieces.
  *
  * Offsets past 4 GB go through the New Style 64-bit commands (NSCMD_TD_READ64/WRITE64) when the device has
  * them, else TD64's, as GFOpenFormat does.
  *
- * Tool types (in its icon, or as KEY=VALUE on the command line): DEVICE=scsi.device, the device chosen first.
+ * Tool types (in its icon, or as KEY=VALUE on the command line): DEVICE=, the device chosen first (acscsi.device
+ * when it is there, else scsi.device).
  *
  * MIT, Copyright (c) 2026 AmiCradle Team. */
 
 #include <exec/types.h>
 #include <exec/memory.h>
 #include <exec/io.h>
+#include <exec/execbase.h>
 #include <devices/trackdisk.h>
 #include <devices/newstyle.h>
 #include <devices/scsidisk.h>
@@ -39,9 +43,10 @@
 
 #include "gfopenlayout_ui.h"
 #include "gfopenlayout_ui_amiga.h"
+#include "iw_drive.h"
 
 #define NAME "GFOpenImageWriter"
-static const char version[] __attribute__((used)) = "$VER: GFOpenImageWriter 1.0 (4.11.2026) MIT, Copyright (c) 2026 AmiCradle Team";
+static const char version[] __attribute__((used)) = "$VER: GFOpenImageWriter 1.1 (14.11.2026) MIT, Copyright (c) 2026 AmiCradle Team";
 unsigned long __stack = 65536;
 
 #ifndef TD_READ64
@@ -52,8 +57,8 @@ unsigned long __stack = 65536;
 struct Library *IconBase;
 
 #define MAX_DEVICES 16
-#define MAX_DRIVES 16
-#define MAX_PARTS 16
+#define MAX_DRIVES IW_LISTED
+#define MAX_PARTS IW_MAX_PARTS
 #define PIECE (256UL * 1024UL)
 
 static void scopy(char *to, const char *from, int size)
@@ -67,13 +72,8 @@ static char devices[MAX_DEVICES][64];
 static int ndevices;
 
 struct drive {
-    ULONG unit;
-    ULONG block_bytes;
-    uint64_t blocks;
-    char label[160];
-    char parts[MAX_PARTS][32];      /* the DOS devices mounted on it ("DH0") */
-    int nparts;
-    int system;                     /* SYS: is on it */
+    iw_drive d;                     /* the unit, its size, model, serial and the volumes mounted from it */
+    char label[200];
 };
 
 static struct drive drives[MAX_DRIVES];
@@ -134,13 +134,7 @@ static int dio_do(struct dio *x, UWORD cmd, uint64_t off, APTR buf, ULONG len)
     return DoIO((struct IORequest *)io) ? (io->io_Error ? io->io_Error : -1) : 0;
 }
 
-static void size_text(uint64_t bytes, char *out)
-{
-    ULONG mb = (ULONG)(bytes >> 20);
-    if (bytes >= (10ULL << 30)) sprintf(out, "%lu GB", (unsigned long)(bytes >> 30));
-    else if (mb >= 1) sprintf(out, "%lu.%lu MB", (unsigned long)mb, (unsigned long)(((bytes >> 10) & 1023) * 10 / 1024));
-    else sprintf(out, "%lu KB", (unsigned long)(bytes >> 10));
-}
+static void size_text(uint64_t bytes, char *out) { iw_size_text(bytes, out, 24); }
 
 static int fssm_of(struct DosList *dl, struct FileSysStartupMsg **f, char *devname)
 {
@@ -180,31 +174,55 @@ static void system_drive(char *name)
     UnLockDosList(LDF_DEVICES | LDF_READ);
 }
 
+/* INQUIRY (page, 0 for the standard data) through HD_SCSICMD into buf; how many bytes came back, or 0 */
+static int inquiry(struct dio *x, int page, UBYTE *buf, int len)
+{
+    struct SCSICmd sc;
+    UBYTE cdb[6] = { 0x12, 0, 0, 0, 0, 0 }, sense[18];
+    if (page) { cdb[1] = 1; cdb[2] = (UBYTE)page; }
+    cdb[4] = (UBYTE)len;
+    memset(&sc, 0, sizeof sc);
+    memset(buf, 0, len);
+    sc.scsi_Data = (UWORD *)buf;
+    sc.scsi_Length = len;
+    sc.scsi_Command = cdb;
+    sc.scsi_CmdLength = 6;
+    sc.scsi_Flags = SCSIF_READ | SCSIF_AUTOSENSE;
+    sc.scsi_SenseData = sense;
+    sc.scsi_SenseLength = sizeof sense;
+    x->io->io_Command = HD_SCSICMD;
+    x->io->io_Data = &sc;
+    x->io->io_Length = sizeof sc;
+    if (DoIO((struct IORequest *)x->io) || sc.scsi_Status) return 0;
+    return (int)sc.scsi_Actual;
+}
+
 static void probe(int devi)
 {
-    ULONG units[MAX_DRIVES];
-    int nunits = 0, i;
+    ULONG mounted[MAX_DRIVES];
+    uint32_t units[MAX_DRIVES], m32[MAX_DRIVES];
+    int nmounted = 0, nunits, i;
     struct DosList *dl;
     char sys[32], devname[64];
-    for (i = 0; i < 8; i++) units[nunits++] = (ULONG)i;
     dl = LockDosList(LDF_DEVICES | LDF_READ);
-    while ((dl = NextDosEntry(dl, LDF_DEVICES))) {
+    while ((dl = NextDosEntry(dl, LDF_DEVICES)) && nmounted < MAX_DRIVES) {
         struct FileSysStartupMsg *f;
-        int have = 0;
         if (!fssm_of(dl, &f, devname) || strcmp(devname, devices[devi])) continue;
-        for (i = 0; i < nunits; i++) if (units[i] == f->fssm_Unit) have = 1;
-        if (!have && nunits < MAX_DRIVES) units[nunits++] = f->fssm_Unit;
+        mounted[nmounted++] = f->fssm_Unit;
     }
     UnLockDosList(LDF_DEVICES | LDF_READ);
+    for (i = 0; i < nmounted; i++) m32[i] = (uint32_t)mounted[i];
+    nunits = iw_units(devices[devi], m32, nmounted, units, MAX_DRIVES);
     system_drive(sys);
 
     ndrives = 0;
     SetWindowPointer(win, WA_BusyPointer, TRUE, TAG_DONE);
     for (i = 0; i < nunits; i++) {
         struct dio x;
-        struct drive *d = &drives[ndrives];
+        struct drive *dr = &drives[ndrives];
+        iw_drive *d = &dr->d;
         struct DriveGeometry g;
-        memset(d, 0, sizeof *d);
+        memset(dr, 0, sizeof *dr);
         d->unit = units[i];
         if (dio_open(&x, devices[devi], d->unit)) {
             memset(&g, 0, sizeof g);
@@ -212,16 +230,18 @@ static void probe(int devi)
             x.io->io_Data = &g;
             x.io->io_Length = sizeof g;
             if (!DoIO((struct IORequest *)x.io) && g.dg_SectorSize >= 256 && g.dg_TotalSectors) {
-                char size[24], vols[96];
-                int k, o = 0;
+                UBYTE inq[96];
+                int n;
                 d->block_bytes = g.dg_SectorSize;
                 d->blocks = g.dg_TotalSectors;
-                /* what is mounted on it */
+                /* the drive by its model and serial: a device without HD_SCSICMD, or without page $80, leaves them "" */
+                if ((n = inquiry(&x, 0, inq, 36)) > 0) iw_inquiry_model(inq, n, d->model, sizeof d->model);
+                if ((n = inquiry(&x, 0x80, inq, sizeof inq)) > 0) iw_vpd_serial(inq, n, d->serial, sizeof d->serial);
+                /* the volumes mounted from it */
                 dl = LockDosList(LDF_DEVICES | LDF_READ);
                 while ((dl = NextDosEntry(dl, LDF_DEVICES)) && d->nparts < MAX_PARTS) {
                     struct FileSysStartupMsg *f;
                     const UBYTE *s;
-                    int n;
                     if (!fssm_of(dl, &f, devname) || strcmp(devname, devices[devi]) || f->fssm_Unit != d->unit) continue;
                     s = (const UBYTE *)BADDR(dl->dol_Name);
                     n = s[0] < 31 ? s[0] : 31;
@@ -231,12 +251,7 @@ static void probe(int devi)
                     d->nparts++;
                 }
                 UnLockDosList(LDF_DEVICES | LDF_READ);
-                vols[0] = 0;
-                for (k = 0; k < d->nparts && o < (int)sizeof vols - 40; k++)
-                    o += sprintf(vols + o, "%s%s:", k ? ", " : "", d->parts[k]);
-                size_text(d->blocks * d->block_bytes, size);
-                snprintf(d->label, sizeof d->label, "Unit %lu: %s%s%s%s", (unsigned long)d->unit, size,
-                         d->nparts ? ", " : "", vols, d->system ? " (the system's)" : "");
+                iw_label(d, dr->label, sizeof dr->label);
                 ndrives++;
             }
         }
@@ -336,7 +351,7 @@ static void progress(uint64_t done, uint64_t total, const char *what)
     pump();
 }
 
-static void inhibit(const struct drive *d, int on)
+static void inhibit(const iw_drive *d, int on)
 {
     int i;
     for (i = 0; i < d->nparts; i++) {
@@ -348,40 +363,25 @@ static void inhibit(const struct drive *d, int on)
 
 static void write_image(void)
 {
-    const struct drive *d = &drives[cur_drive];
+    const iw_drive *d = &drives[cur_drive].d;
     const char *path = olui_get_text(el("file"));
     struct dio x;
     BPTR fh;
     struct FileInfoBlock *fib;
-    uint64_t size = 0, total, at = 0;
+    uint64_t size = 0, at = 0;
     UBYTE *buf = NULL, *back = NULL;
-    int verify = olui_get_checked(el("verify")), e = 0, i, o;
-    char text[512], s1[24], s2[24];
+    int verify = olui_get_checked(el("verify")), e = 0;
+    char text[512], s1[24];
     const char *why = NULL;
 
     if (!path[0]) { ask("Choose the image first.", "OK"); return; }
-    if (d->system) { ask("That drive holds the volume the system started from: it can't be written while it runs.", "OK"); return; }
     if (!(fh = Open((STRPTR)path, MODE_OLDFILE))) { ask("Can't open the image.", "OK"); return; }
     if ((fib = AllocDosObject(DOS_FIB, NULL))) {
         if (ExamineFH(fh, fib)) size = (ULONG)fib->fib_Size;
         FreeDosObject(DOS_FIB, fib);
     }
-    total = d->blocks * d->block_bytes;
-    if (!size) { Close(fh); ask("The image is empty, or its size can't be read.", "OK"); return; }
-    if (size > total) {
-        size_text(size, s1);
-        size_text(total, s2);
-        snprintf(text, sizeof text, "The image (%s) is bigger than the drive (%s).", s1, s2);
-        Close(fh);
-        ask(text, "OK");
-        return;
-    }
-    size_text(size, s1);
-    o = snprintf(text, sizeof text, "Write %s to %s unit %lu?\n\nEverything on the drive is lost", s1, devices[cur_dev],
-                 (unsigned long)d->unit);
-    for (i = 0; i < d->nparts && o < (int)sizeof text - 80; i++)
-        o += snprintf(text + o, sizeof text - o, "%s%s:", i ? ", " : ": ", d->parts[i]);
-    snprintf(text + o, sizeof text - o, ".");
+    if ((why = iw_refuse(d, devices[cur_dev], size, text, sizeof text))) { Close(fh); ask(why, "OK"); return; }
+    iw_confirm(d, devices[cur_dev], size, text, sizeof text);
     if (!ask(text, "Write|Cancel")) { Close(fh); return; }
 
     buf = AllocVec(PIECE, MEMF_PUBLIC);
@@ -439,7 +439,7 @@ static void write_image(void)
 
 static void read_image(void)
 {
-    const struct drive *d = &drives[cur_drive];
+    const iw_drive *d = &drives[cur_drive].d;
     struct FileRequester *fr;
     struct dio x;
     char path[512], text[320], s1[24];
@@ -566,6 +566,9 @@ int main(int argc, char **argv)
     int fh, w, h, i, rc = RETURN_FAIL;
     (void)version;
     IconBase = OpenLibrary((STRPTR)"icon.library", 37);
+    Forbid();
+    if (FindName(&SysBase->DeviceList, (STRPTR)"acscsi.device")) strcpy(first, "acscsi.device");   /* GFOS's drives */
+    Permit();
     settings(argc, argv, first, sizeof first);
     find_devices(first);
     if (!(scr = LockPubScreen(NULL))) goto out;
@@ -574,7 +577,7 @@ int main(int argc, char **argv)
     h = fh * 26;
     if (w > scr->Width) w = scr->Width;
     if (h > scr->Height - scr->BarHeight - 1) h = scr->Height - scr->BarHeight - 1;
-    win = OpenWindowTags(NULL, WA_PubScreen, (ULONG)scr, WA_Title, (ULONG)"Image Writer", WA_ScreenTitle, (ULONG)NAME " 1.0",
+    win = OpenWindowTags(NULL, WA_PubScreen, (ULONG)scr, WA_Title, (ULONG)"Image Writer", WA_ScreenTitle, (ULONG)NAME " 1.1",
                          WA_Left, (scr->Width - w) / 2, WA_Top, (scr->Height - h) / 2, WA_Width, w, WA_Height, h,
                          WA_MinWidth, fh * 40, WA_MinHeight, fh * 18, WA_MaxWidth, ~0UL, WA_MaxHeight, ~0UL,
                          WA_DragBar, TRUE, WA_DepthGadget, TRUE, WA_CloseGadget, TRUE, WA_SizeGadget, TRUE,
